@@ -7,6 +7,8 @@ Small collection of Python scripts for interacting with Betaflight/MultiWii-comp
 - `motor-pulse-betaflight.py` — Alternate motor pulser.
 - `diagnose-fc.py` — Helper script for diagnosing flight controller (FC) responses.
 - `script-drone-betaflight-data.py` — Reads live Betaflight telemetry (attitude, IMU, battery, etc.).
+- `unified_launcher.py` — Integrates Betaflight MSP attitude polling with synchronized finite-state machines for hatch control and motor arming.
+- `mock_drone.py` — Software-in-the-loop bridge for testing `unified_launcher.py` without a real flight controller.
 - `requirements.txt` — Python dependencies.
 - `chat.json` (archived) — Chat/agent history, moved to `archive/`.
 
@@ -40,6 +42,23 @@ This script reads live telemetry data from a Betaflight-compatible flight contro
 - Attitude (roll, pitch, yaw).
 - IMU data (accelerometer, gyroscope).
 - Battery status and voltage.
+
+### `unified_launcher.py`
+This script integrates Betaflight MSP attitude polling with two synchronized finite-state machines:
+- `HatchMachine`: Controls the hatch servo based on predicted angles.
+- `DroneMachine`: Arms motors only when conditions are safe.
+
+It uses a threading model to ensure real-time IMU polling and state-machine transitions without blocking. The dashboard provides live updates on the hatch and drone states.
+
+### `mock_drone.py`
+This script acts as a software-in-the-loop (SITL) bridge for testing `unified_launcher.py` without requiring a real flight controller. It simulates MSP_ATTITUDE responses over a TCP socket, allowing you to:
+- Test the launcher logic with predefined attitude sequences.
+- Avoid the need for COM drivers or hardware during development.
+
+To use:
+1. Run `mock_drone.py` to start the TCP server.
+2. Set `COM_PORT = "socket://127.0.0.1:5555"` in `unified_launcher.py`.
+3. Run `unified_launcher.py` to connect to the mock server and test the logic.
 
 ### Archived Files
 - `chat.json`: This file contained chat/agent history and is not required for running the project. It has been moved to the `archive/` directory to keep the workspace clean.

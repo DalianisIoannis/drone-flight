@@ -36,6 +36,7 @@ import signal
 import sys
 import threading
 import time
+import urllib.request
 from collections import deque
 from enum import Enum, auto
 from typing import Optional
@@ -54,9 +55,13 @@ ABORT_MARGIN: float = 15.0      # °  – abort-while-opening threshold
 OPEN_DURATION: float = 2.0      # s  – hatch opening duration
 LAUNCH_DURATION: float = 2.5    # s  – motor spin-up duration (matches motor pulse script)
 PREDICTION_HORIZON: float = 2.0 # s  – how far ahead to predict attitude
+MIN_HISTORY_SAMPLES: int = 20   # samples before prediction fires (~1 s @ 20 Hz)
 
 MOTOR_TEST_VALUE: int = 1100    # Safe default (DSHOT: ~100-300, PWM: ~1100)
 MOTOR_OFF_VALUE: int = 1000     # 0 for DSHOT, 1000 for PWM. (Betaflight UI shows 1000 for OFF)
+
+# Hatch HTTP controller (ESP32 or similar)
+HATCH_BASE_URL: str = "http://172.20.10.2"   # ← IP of your hatch controller
 
 # MSP command descriptors (matches MultiWii.send / .receive signature)
 MSP_ATTITUDE = {"message_id": 108, "direction": "<"}
@@ -66,12 +71,14 @@ MSP_SET_MOTOR = {"message_id": 214, "direction": "<"}
 #  State enumerations
 # ─────────────────────────────────────────────
 class HatchState(Enum):
-    PREDICTING = auto()
-    OPENING    = auto()
-    OPEN       = auto()
-    CLOSING    = auto()
-    CLOSED     = auto()
-    ABORT      = auto()
+    PREDICTING    = auto()
+    OPENING       = auto()   # physical hatch is moving
+    AWAITING_OPEN = auto()   # waiting for HTTP /open ACK
+    OPEN          = auto()
+    CLOSING       = auto()   # physical hatch is moving
+    AWAITING_CLOSE= auto()   # waiting for HTTP /close ACK
+    CLOSED        = auto()
+    ABORT         = auto()
 
 class DroneState(Enum):
     IDLE       = auto()
@@ -185,6 +192,7 @@ class HatchMachine:
                 self._timer = threading.Timer(OPEN_DURATION, self._on_close_complete)
                 self._timer.daemon = True
                 self._timer.start()
+                # /close ACK will be awaited in _on_close_complete
             elif self.state == HatchState.PREDICTING:
                 self.state = HatchState.ABORT
 
@@ -197,6 +205,9 @@ class HatchMachine:
     # ── private helpers ──────────────────────────────────────────────────────
 
     def _check_predicting(self) -> None:
+        # Wait for warm-up window before evaluating the prediction gate
+        if len(self._imu._history) < MIN_HISTORY_SAMPLES:
+            return
         predicted = self._imu.predict_max_angle()
         if predicted <= ANGLE_MARGIN:
             with self._lock:
@@ -205,6 +216,8 @@ class HatchMachine:
                     self._timer = threading.Timer(OPEN_DURATION, self._on_open_complete)
                     self._timer.daemon = True
                     self._timer.start()
+                    # NOTE: HTTP /open is fired in _on_open_complete after the physical
+                    # delay, so ACK gates the OPEN state transition.
 
     def _check_opening(self) -> None:
         roll, pitch, _ = self._imu.snapshot()
@@ -224,16 +237,34 @@ class HatchMachine:
                     self._timer = threading.Timer(OPEN_DURATION, self._on_close_complete)
                     self._timer.daemon = True
                     self._timer.start()
+                    # NOTE: HTTP /close is fired in _on_close_complete after the physical
+                    # delay, so ACK gates the CLOSED state transition.
 
     def _on_open_complete(self) -> None:
+        """Fires after OPEN_DURATION. Sends /open and waits for ACK before setting OPEN."""
         with self._lock:
-            if self.state == HatchState.OPENING:
-                self.state = HatchState.OPEN
+            if self.state != HatchState.OPENING:
+                return
+            self.state = HatchState.AWAITING_OPEN
+        # Block here (Timer thread) until we get the ACK
+        ok = request_hatch_ok("/open")
+        if ok:
+            time.sleep(1.0)  # 1-second settle time after ACK before drone can fire
+        with self._lock:
+            if self.state == HatchState.AWAITING_OPEN:
+                self.state = HatchState.OPEN if ok else HatchState.ABORT
 
     def _on_close_complete(self) -> None:
+        """Fires after OPEN_DURATION. Sends /close and waits for ACK before setting CLOSED."""
         with self._lock:
-            if self.state == HatchState.CLOSING:
-                self.state = HatchState.CLOSED
+            if self.state != HatchState.CLOSING:
+                return
+            self.state = HatchState.AWAITING_CLOSE
+        # Block here (Timer thread) until we get the ACK
+        ok = request_hatch_ok("/close")
+        with self._lock:
+            if self.state == HatchState.AWAITING_CLOSE:
+                self.state = HatchState.CLOSED if ok else HatchState.ABORT
 
     def _cancel_timer(self) -> None:
         if self._timer is not None:
@@ -310,7 +341,24 @@ class DroneMachine:
             self._launch_timer = None
 
 # ─────────────────────────────────────────────
-#  Motor Helpers (Direct MSP)
+#  Hatch HTTP helpers
+# ─────────────────────────────────────────────
+def request_hatch_ok(path: str) -> bool:
+    """
+    Synchronous GET to HATCH_BASE_URL + path.
+    Returns True on HTTP 2xx, False on any error.
+    Intended to be called from Timer callbacks (already on a background thread).
+    """
+    url = HATCH_BASE_URL + path
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            body = resp.read().decode("utf-8", errors="replace").strip()
+            print(f"\n[Hatch HTTP] {url} → {resp.status} {body}", flush=True)
+            return 200 <= resp.status < 300
+    except Exception as exc:
+        print(f"\n[Hatch HTTP] {url} ✗ ({exc})", flush=True)
+        return False
+
 # ─────────────────────────────────────────────
 import struct
 
@@ -414,12 +462,14 @@ def imu_poller(
 #  Dashboard
 # ─────────────────────────────────────────────
 _HATCH_COLOUR = {
-    HatchState.PREDICTING: "\033[33m",   # yellow
-    HatchState.OPENING:    "\033[36m",   # cyan
-    HatchState.OPEN:       "\033[32m",   # green
-    HatchState.CLOSING:    "\033[35m",   # magenta
-    HatchState.CLOSED:     "\033[90m",   # dark grey
-    HatchState.ABORT:      "\033[31m",   # red
+    HatchState.PREDICTING:     "\033[33m",   # yellow
+    HatchState.OPENING:        "\033[36m",   # cyan
+    HatchState.AWAITING_OPEN:  "\033[96m",   # bright cyan
+    HatchState.OPEN:           "\033[32m",   # green
+    HatchState.CLOSING:        "\033[35m",   # magenta
+    HatchState.AWAITING_CLOSE: "\033[95m",   # bright magenta
+    HatchState.CLOSED:         "\033[90m",   # dark grey
+    HatchState.ABORT:          "\033[31m",   # red
 }
 _DRONE_COLOUR = {
     DroneState.IDLE:       "\033[33m",
@@ -501,10 +551,16 @@ def main() -> None:
         while not stop_event.is_set():
             print_dashboard(imu, hatch, drone)
 
-            # Reset instead of exiting once both FSMs have reached terminal states
+            # On a successful launch, exit permanently.
+            if drone.state == DroneState.LAUNCHED and hatch.state == HatchState.CLOSED:
+                time.sleep(1.0)
+                break
+
+            # On abort, wait 2.5 s then reset for another attempt.
             if (hatch.state in (HatchState.CLOSED, HatchState.ABORT) and
-                    drone.state in (DroneState.LAUNCHED, DroneState.ABORT)):
-                time.sleep(2.5)    # let final state render for 2.5s before resetting
+                    drone.state == DroneState.ABORT):
+                print("\n[ABORT] Resetting for next attempt...", flush=True)
+                time.sleep(2.5)
                 hatch.reset()
                 drone.reset()
 

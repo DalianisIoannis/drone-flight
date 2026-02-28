@@ -21,3 +21,8 @@ __pycache__/
 
 # Archive (do not commit chat history or large dumps)
 archive/
+
+Hackathon presentation.odp
+Hackathon presentation.pdf
+Hackathon_Presentation.pptx
+build_presentation.py

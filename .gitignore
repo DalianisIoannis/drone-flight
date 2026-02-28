@@ -1,0 +1,23 @@
+## Virtual environment
+.env/
+.venv/
+
+## Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Editor folders
+.vscode/
+
+# OS
+.DS_Store
+
+# Logs and temporary files
+*.log
+.pytest_cache/
+.mypy_cache/
+
+# Archive (do not commit chat history or large dumps)
+archive/
